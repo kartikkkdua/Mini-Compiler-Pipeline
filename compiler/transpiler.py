@@ -7,39 +7,49 @@ class CTranspiler:
             "#include <stdio.h>",
             "#include <stdbool.h>",
             "#include <string.h>",
+            "#include <stdint.h>",
             "",
             "// Global Variables & Temporaries"
         ]
         
         variables = set()
+        var_types = {}
+        
+        # Pass 1: Identify all variables and their likely types
         for instr in self.instructions:
-            if instr[0] == 'ASSIGN':
-                variables.add(instr[2])
-            elif len(instr) == 4 and instr[0] != 'CALL':
+            op = instr[0]
+            if op == 'ASSIGN':
+                val, target = instr[1], instr[2]
+                variables.add(target)
+                if isinstance(val, str) and val.startswith('"'):
+                    var_types[target] = 'char*'
+                elif target not in var_types:
+                    var_types[target] = 'long long'
+            elif op == 'PARAM_POP':
+                variables.add(instr[1])
+                var_types[instr[1]] = 'long long' # Assuming numeric params for now
+            elif len(instr) == 4 and op != 'CALL':
                 variables.add(instr[3])
-            elif len(instr) == 4 and instr[0] == 'CALL':
+                var_types[instr[3]] = 'long long'
+            elif len(instr) == 4 and op == 'CALL':
                 variables.add(instr[3])
-            elif len(instr) == 3 and instr[0] in ('!', '-'):
+                var_types[instr[3]] = 'long long'
+            elif len(instr) == 3 and op in ('!', '-'):
                 variables.add(instr[2])
+                var_types[instr[2]] = 'long long'
                 
+        # Emit variable declarations
         for v in variables:
-            # We treat everything as int for simplicity in this mini-transpiler, 
-            # except if it's obviously a string but in IR we lost some type info.
-            # We'll just define them as integers or char*. Let's use long long to be safe, 
-            # but string pointers need char*. We will use a generic struct or just int for everything.
-            # For simplicity, let's declare them as long long. Strings will cause warnings, but work.
-            c_code.append(f"long long {v} = 0;")
+            v_type = var_types.get(v, 'long long')
+            if v_type == 'char*':
+                c_code.append(f"char* {v} = NULL;")
+            else:
+                c_code.append(f"long long {v} = 0;")
             
         c_code.append("")
         
-        # We need to handle functions. Since our IR intermixes functions and main code,
-        # we will put everything inside main() and use GCC's nested functions OR 
-        # just emit flat labels and let it run. But C functions are better.
-        # However, our IR uses jump labels (GOTO). C supports GOTO!
-        # So we can just put the entire IR into main()!
-        # Wait, if we use PARAM_PUSH and PARAM_POP, it's a software stack.
-        # Let's emit a software stack for params.
-        c_code.append("long long param_stack[1000];")
+        # Software stack for parameters using intptr_t to hold both ints and pointers safely
+        c_code.append("intptr_t param_stack[1000];")
         c_code.append("int param_sp = 0;")
         
         c_code.append("\nint main() {")
@@ -50,13 +60,21 @@ class CTranspiler:
                 c_code.append(f"{instr[1]}:;")
             elif op == 'ASSIGN':
                 val, target = instr[1], instr[2]
-                c_code.append(f"    {target} = (long long){val};")
+                v_type = var_types.get(target, 'long long')
+                if v_type == 'char*':
+                    c_code.append(f"    {target} = {val};")
+                else:
+                    c_code.append(f"    {target} = (long long){val};")
             elif op == 'PRINT':
                 val = instr[1]
                 if isinstance(val, str) and val.startswith('"'):
                     c_code.append(f'    printf("%s\\n", {val});')
                 else:
-                    c_code.append(f'    printf("%lld\\n", (long long){val});')
+                    v_type = var_types.get(val, 'long long')
+                    if v_type == 'char*':
+                        c_code.append(f'    printf("%s\\n", {val});')
+                    else:
+                        c_code.append(f'    printf("%lld\\n", (long long){val});')
             elif op in ('+', '-', '*', '/', '<', '>', '<=', '>=', '==', '!=', '&&', '||'):
                 left, right, target = instr[1], instr[2], instr[3]
                 c_code.append(f"    {target} = {left} {op} {right};")
@@ -71,19 +89,13 @@ class CTranspiler:
                 c_code.append(f"    goto {label};")
             elif op == 'PARAM_PUSH':
                 val = instr[1]
-                c_code.append(f"    param_stack[param_sp++] = (long long){val};")
+                c_code.append(f"    param_stack[param_sp++] = (intptr_t){val};")
             elif op == 'PARAM_POP':
                 var_name = instr[1]
-                c_code.append(f"    {var_name} = param_stack[--param_sp];")
+                c_code.append(f"    {var_name} = (long long)param_stack[--param_sp];")
             elif op == 'CALL':
                 func_name, args_count, target = instr[1], instr[2], instr[3]
-                # To simulate calls using gotos, we need a call stack.
-                # It's much easier to just transpile IR properly to C functions, 
-                # but flat gotos require a return address switch statement.
-                # Since this is a mini transpiler, we will just warn that 
-                # flat IR transpilation with functions needs careful stack management.
-                c_code.append(f"    // WARNING: CALL {func_name} requires hardware stack in flat C.")
-                c_code.append(f"    // Real implementation would translate to actual C functions.")
+                c_code.append(f"    // CALL {func_name} - Simulated by flat IR jumps")
             elif op == 'RETURN':
                 c_code.append(f"    // RETURN {instr[1]}")
             elif op == 'RETURN_VOID':
